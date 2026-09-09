@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"strings"
 )
 
@@ -144,27 +145,85 @@ func (c *HTTPGitHubClient) GetWebhook(ctx context.Context, owner, repo string, h
 
 // ListWebhooks retrieves all webhooks for a repository.
 func (c *HTTPGitHubClient) ListWebhooks(ctx context.Context, owner, repo string) ([]*Webhook, error) {
-	path := fmt.Sprintf("/repos/%s/%s/hooks", owner, repo)
-	req, err := c.newRequest(ctx, http.MethodGet, path, nil)
-	if err != nil {
-		return nil, err
-	}
-
-	resp, err := c.HTTPClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("network error listing github webhooks: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if err := c.checkResponseError(resp); err != nil {
-		return nil, err
-	}
-
+	basePath := fmt.Sprintf("/repos/%s/%s/hooks", owner, repo)
+	nextPath := basePath
+	seen := make(map[string]bool)
 	var hooks []*Webhook
-	if err := json.NewDecoder(resp.Body).Decode(&hooks); err != nil {
-		return nil, fmt.Errorf("failed to decode webhooks response: %w", err)
+	for page := 1; nextPath != ""; page++ {
+		if seen[nextPath] || page > 1000 {
+			return nil, fmt.Errorf("incomplete webhook listing: pagination cycle or page limit")
+		}
+		seen[nextPath] = true
+		req, err := c.newRequest(ctx, http.MethodGet, nextPath, nil)
+		if err != nil {
+			return nil, err
+		}
+		resp, err := c.HTTPClient.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("network error listing github webhooks: %w", err)
+		}
+		if err := c.checkResponseError(resp); err != nil {
+			resp.Body.Close()
+			if page > 1 && errors.Is(err, ErrWebhookNotFound) {
+				// A missing later page is an incomplete list, not evidence that
+				// the repository has no webhook. Do not expose the create sentinel.
+				return nil, fmt.Errorf("incomplete webhook listing on page %d: %v", page, err)
+			}
+			return nil, err
+		}
+		var batch []*Webhook
+		err = json.NewDecoder(resp.Body).Decode(&batch)
+		resp.Body.Close()
+		if err != nil {
+			return nil, fmt.Errorf("failed to decode webhooks response: %w", err)
+		}
+		hooks = append(hooks, batch...)
+		nextPath, err = nextWebhookListPath(resp.Header.Get("Link"), req.URL, basePath)
+		if err != nil {
+			return nil, err
+		}
 	}
 	return hooks, nil
+}
+
+// Only copy pagination query parameters back to the original endpoint. Never
+// send the client's authorization token to a different host or repository.
+func nextWebhookListPath(header string, current *url.URL, basePath string) (string, error) {
+	if strings.TrimSpace(header) == "" {
+		return "", nil
+	}
+	for _, link := range strings.Split(header, ",") {
+		start, end := strings.Index(link, "<"), strings.Index(link, ">")
+		if start < 0 || end <= start {
+			return "", fmt.Errorf("incomplete webhook listing: malformed pagination link")
+		}
+		isNext := false
+		for _, parameter := range strings.Split(link[end+1:], ";") {
+			name, value, ok := strings.Cut(strings.TrimSpace(parameter), "=")
+			if ok && name == "rel" {
+				for _, relation := range strings.Fields(strings.Trim(value, "\"")) {
+					isNext = isNext || relation == "next"
+				}
+			}
+		}
+		if !isNext {
+			continue
+		}
+		target, err := url.Parse(link[start+1 : end])
+		if err != nil {
+			return "", fmt.Errorf("incomplete webhook listing: invalid pagination URL: %w", err)
+		}
+		target = current.ResolveReference(target)
+		if target.Scheme != current.Scheme || target.Host != current.Host || target.Path != current.Path || target.User != nil {
+			return "", fmt.Errorf("incomplete webhook listing: pagination target differs from original endpoint")
+		}
+		query := target.Query().Encode()
+		if query == "" {
+			return basePath, nil
+		}
+		return basePath + "?" + query, nil
+	}
+	return "", nil
 }
 
 // CreateWebhook creates a new webhook for a repository.
